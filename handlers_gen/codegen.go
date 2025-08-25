@@ -1,18 +1,141 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"log"
-	"os"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
+var (
+	apiGenPrefix       = "// apigen:api "
+	validatorRequired  = "required"
+	validatorParamName = "paramname"
+	validatorEnum      = "enum"
+	validatorMin       = "min"
+	validatorMax       = "max"
+	validatorDefault   = "default"
+)
 
-func getGeneratedFuncs(node *ast.File) []*ast.FuncDecl {
-	genFuncs := make([]*ast.FuncDecl, 0)
+type ApiGenApi struct {
+	Url    string `json:"url"`
+	Auth   bool   `json:"auth"`
+	Method string `json:"method"`
+}
+
+type GeneratedFunc struct {
+	Receiver         *ast.FieldList
+	ReceiverTypeName string
+	FuncName         string
+
+	InTypeName string // remove?
+	In         *ast.Field
+
+	Url    string
+	Auth   bool
+	Method string
+}
+
+type ValidatorValue[T any] struct {
+	Value T
+	Exist bool
+}
+
+func NewValidatorValue[T any](value T) ValidatorValue[T] {
+	return ValidatorValue[T]{
+		Value: value,
+		Exist: true,
+	}
+}
+
+type GeneratedParamsField struct {
+	FieldName string
+	FieldType string // int, string todo remove?
+	IsInt     bool   // ?
+	IsString  bool   // ?
+
+	DefaultValue ValidatorValue[string]
+	Requred      ValidatorValue[bool]
+	Enum         ValidatorValue[[]string]
+	ParamName    ValidatorValue[string]
+	Min          ValidatorValue[int]
+	Max          ValidatorValue[int]
+}
+
+// todo: мапа?
+type GeneratedStruct struct {
+	Name       string
+	Attributes []GeneratedParamsField
+}
+
+func getValidatorValue(tagValue string) string {
+	val := strings.Split(tagValue, "=")
+
+	return val[1]
+}
+
+func getValidatorEnumValue(enumValue string) []string {
+	return strings.Split(enumValue, "|")
+}
+
+func getGeneratedParamsField(tagValue string) GeneratedParamsField {
+	params := GeneratedParamsField{}
+
+	values := strings.Split(tagValue, ",")
+
+	for _, v := range values {
+		if v == validatorRequired {
+			params.Requred = NewValidatorValue(true)
+		}
+
+		if v == validatorParamName {
+			val := getValidatorValue(v)
+			params.ParamName = NewValidatorValue(val)
+		}
+
+		if v == validatorEnum {
+			val := getValidatorValue(v)
+			values := getValidatorEnumValue(val)
+			params.Enum = NewValidatorValue(values)
+		}
+
+		if v == validatorDefault {
+			val := getValidatorValue(v)
+			params.DefaultValue = NewValidatorValue(val)
+		}
+
+		if v == validatorMin {
+			val := getValidatorValue(v)
+
+			min, err := strconv.Atoi(val)
+			if err != nil {
+				panic(err)
+			}
+			params.Min = NewValidatorValue(min)
+		}
+
+		if v == validatorMax {
+			val := getValidatorValue(v)
+
+			max, err := strconv.Atoi(val)
+			if err != nil {
+				panic(err)
+			}
+
+			params.Max = NewValidatorValue(max)
+		}
+	}
+
+	return params
+}
+
+func getGeneratedFuncs(node *ast.File) []GeneratedFunc {
+	genFuncs := make([]GeneratedFunc, 0)
 
 	for _, decl := range node.Decls {
 		f, ok := decl.(*ast.FuncDecl)
@@ -27,24 +150,55 @@ func getGeneratedFuncs(node *ast.File) []*ast.FuncDecl {
 			continue
 		}
 
-		needCodegen := false
+		apiGenStr := ""
 		for _, comment := range f.Doc.List {
-			needCodegen = needCodegen || strings.HasPrefix(comment.Text, "// apigen:api")
+			str, found := strings.CutPrefix(comment.Text, apiGenPrefix)
+			if found {
+				apiGenStr = str
+				break
+			}
 		}
 
-		if !needCodegen {
+		if apiGenStr == "" {
 			fmt.Printf("SKIP method %#v doesnt have apigen mark\n", f.Name.Name)
 			continue
 		}
 
-		fmt.Println(f)
-		genFuncs = append(genFuncs, f)
+		apiGen := &ApiGenApi{}
+		err := json.Unmarshal([]byte(apiGenStr), apiGen)
+		if err != nil {
+			panic(err)
+		}
+
+		generatedFunc := GeneratedFunc{
+			Method:   apiGen.Method,
+			Url:      apiGen.Url,
+			Auth:     apiGen.Auth,
+			FuncName: f.Name.Name,
+			Receiver: f.Recv,
+		}
+
+		for _, field := range f.Recv.List {
+			fieldType := field.Type.(*ast.StarExpr)
+			fieldName := fieldType.X.(*ast.Ident).Name
+			fmt.Println(fieldName)
+			generatedFunc.ReceiverTypeName = fieldName
+		}
+
+		for index, param := range f.Type.Params.List {
+			if index > 0 {
+				generatedFunc.In = param
+				generatedFunc.InTypeName = param.Type.(*ast.Ident).Name
+			}
+		}
+
+		genFuncs = append(genFuncs, generatedFunc)
 	}
 
 	return genFuncs
 }
 
-func main2() {
+func main() {
 	fset := token.NewFileSet()
 	// node, err := parser.ParseFile(fset, os.Args[1], nil, parser.ParseComments)
 	node, err := parser.ParseFile(fset, "../api.go", nil, parser.ParseComments)
@@ -54,15 +208,17 @@ func main2() {
 		log.Fatal(err)
 	}
 
-	// out, _ := os.Create(os.Args[2])
-	out, _ := os.Create("api_handlers.go")
+	apiValidatorReg := regexp.MustCompile(`apivalidator:"([^"]+)"`)
 
-	fmt.Println(out, `package `+node.Name.Name)
-	fmt.Fprintln(out)
+	// out, _ := os.Create(os.Args[2])
+	// out, _ := os.Create("api_handlers.go")
+
+	// fmt.Println(out, `package `+node.Name.Name)
+	// fmt.Fprintln(out)
 
 	genFuncs := getGeneratedFuncs(node)
 
-	genStructs := make([]*ast.GenDecl, 0)
+	genStructs := make([]GeneratedStruct, 0)
 
 	for _, decl := range node.Decls {
 		g, ok := decl.(*ast.GenDecl)
@@ -71,6 +227,11 @@ func main2() {
 			fmt.Printf("SKIP %#T is not &ast.GenDecl\n", decl)
 			continue
 		}
+
+		// todo: нужны метки на циклы, чтобы понять в самом нижнем цикле что валидация по итогу не нужна?
+		genStruct := GeneratedStruct{}
+
+		fmt.Println(g)
 
 		// SPECS_LOOP:
 		for _, spec := range g.Specs {
@@ -86,13 +247,29 @@ func main2() {
 				continue
 			}
 
-			// for _, field := currStruct.Fields.List {
+			fmt.Println(currStruct)
 
-			// }
+			needCodegen := false
+			for _, field := range currStruct.Fields.List {
+				tag := field.Tag
+
+				if tag == nil {
+					continue
+				}
+
+				match := apiValidatorReg.FindStringSubmatch(tag.Value)
+
+				if len(match) > 1 {
+					needCodegen = needCodegen || true
+					validatorValueString := match[1] // required,min=3
+					generatedParams := getGeneratedParamsField(validatorValueString)
+					fmt.Println(generatedParams)
+				}
+			}
 		}
 
 		fmt.Println(g)
-		genStructs = append(genStructs, g)
+		// genStructs = append(genStructs, g)
 	}
 
 	fmt.Println(genFuncs, genStructs)
