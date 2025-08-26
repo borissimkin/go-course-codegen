@@ -55,12 +55,10 @@ func NewValidatorValue[T any](value T) ValidatorValue[T] {
 
 type GeneratedParamsField struct {
 	FieldName string
-	FieldType string // int, string todo remove?
-	IsInt     bool   // ?
-	IsString  bool   // ?
+	FieldType string
 
 	DefaultValue ValidatorValue[string]
-	Requred      ValidatorValue[bool]
+	Required     ValidatorValue[bool]
 	Enum         ValidatorValue[[]string]
 	ParamName    ValidatorValue[string]
 	Min          ValidatorValue[int]
@@ -90,7 +88,7 @@ func getGeneratedParamsField(tagValue string) GeneratedParamsField {
 
 	for _, v := range values {
 		if v == validatorRequired {
-			params.Requred = NewValidatorValue(true)
+			params.Required = NewValidatorValue(true)
 		}
 
 		if v == validatorParamName {
@@ -229,7 +227,6 @@ func main() {
 		}
 
 		// todo: нужны метки на циклы, чтобы понять в самом нижнем цикле что валидация по итогу не нужна?
-		genStruct := GeneratedStruct{}
 
 		fmt.Println(g)
 
@@ -247,7 +244,11 @@ func main() {
 				continue
 			}
 
-			fmt.Println(currStruct)
+			fmt.Println(currType.Name.Name)
+
+			genStruct := GeneratedStruct{
+				Name: currType.Name.Name,
+			}
 
 			needCodegen := false
 			for _, field := range currStruct.Fields.List {
@@ -259,17 +260,30 @@ func main() {
 
 				match := apiValidatorReg.FindStringSubmatch(tag.Value)
 
+				// todo: reverse statement
 				if len(match) > 1 {
 					needCodegen = needCodegen || true
 					validatorValueString := match[1] // required,min=3
 					generatedParams := getGeneratedParamsField(validatorValueString)
+
+					for _, name := range field.Names {
+						generatedParams.FieldName = name.Name
+					}
+
+					t, ok := field.Type.(*ast.Ident)
+					if ok {
+						generatedParams.FieldType = t.Name
+					}
+
+					genStruct.Attributes = append(genStruct.Attributes, generatedParams)
 					fmt.Println(generatedParams)
 				}
 			}
-		}
 
-		fmt.Println(g)
-		// genStructs = append(genStructs, g)
+			if needCodegen {
+				genStructs = append(genStructs, genStruct)
+			}
+		}
 	}
 
 	fmt.Println(genFuncs, genStructs)
