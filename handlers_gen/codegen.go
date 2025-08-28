@@ -6,10 +6,35 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"log"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
+)
+
+type serveHTTPTempl struct {
+	ReceiverTypeName string
+	GeneratedFuncs   []GeneratedFunc
+}
+
+var (
+	serveHTTPTemplate = template.Must(template.New("serveHTTPTempl").Parse(`
+	// {{.ReceiverTypeName}}
+	func (h *{{.ReceiverTypeName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+			{{range $val := .GeneratedFuncs}}
+			case "{{$val.Url}}":
+				h.handler{{$val.FuncName}}(w, r)
+			{{end}}
+			default:
+				w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	`))
 )
 
 var (
@@ -196,27 +221,9 @@ func getGeneratedFuncs(node *ast.File) []GeneratedFunc {
 	return genFuncs
 }
 
-func main() {
-	fset := token.NewFileSet()
-	// node, err := parser.ParseFile(fset, os.Args[1], nil, parser.ParseComments)
-	node, err := parser.ParseFile(fset, "../api.go", nil, parser.ParseComments)
-	fmt.Println(node, err)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	apiValidatorReg := regexp.MustCompile(`apivalidator:"([^"]+)"`)
-
-	// out, _ := os.Create(os.Args[2])
-	// out, _ := os.Create("api_handlers.go")
-
-	// fmt.Println(out, `package `+node.Name.Name)
-	// fmt.Fprintln(out)
-
-	genFuncs := getGeneratedFuncs(node)
-
+func getGeneratedStructs(node *ast.File) []GeneratedStruct {
 	genStructs := make([]GeneratedStruct, 0)
+	apiValidatorReg := regexp.MustCompile(`apivalidator:"([^"]+)"`)
 
 	for _, decl := range node.Decls {
 		g, ok := decl.(*ast.GenDecl)
@@ -260,10 +267,9 @@ func main() {
 
 				match := apiValidatorReg.FindStringSubmatch(tag.Value)
 
-				// todo: reverse statement
 				if len(match) > 1 {
 					needCodegen = needCodegen || true
-					validatorValueString := match[1] // required,min=3
+					validatorValueString := match[1]
 					generatedParams := getGeneratedParamsField(validatorValueString)
 
 					for _, name := range field.Names {
@@ -286,7 +292,53 @@ func main() {
 		}
 	}
 
-	fmt.Println(genFuncs, genStructs)
+	return genStructs
 }
 
-// код писать тут
+func writeImports(out io.Writer) {
+	fmt.Fprintln(out, `
+	import (
+	"context"
+	"encoding/json"
+	"net/http"
+)`)
+}
+
+func generateCode(out io.Writer, funcs []GeneratedFunc, structs []GeneratedStruct) error {
+	funcsMap := make(map[string][]GeneratedFunc, len(funcs))
+
+	for _, f := range funcs {
+		funcsMap[f.ReceiverTypeName] = append(funcsMap[f.ReceiverTypeName], f)
+	}
+
+	for k, v := range funcsMap {
+		serveHTTPTemplate.Execute(out, serveHTTPTempl{
+			ReceiverTypeName: k,
+			GeneratedFuncs:   v,
+		})
+	}
+
+	return nil
+}
+
+func main() {
+	fset := token.NewFileSet()
+	// node, err := parser.ParseFile(fset, os.Args[1], nil, parser.ParseComments)
+	node, err := parser.ParseFile(fset, "../api.go", nil, parser.ParseComments)
+	fmt.Println(node, err)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// out, _ := os.Create(os.Args[2])
+	out, _ := os.Create("api_handlers.go")
+
+	genFuncs := getGeneratedFuncs(node)
+
+	genStructs := getGeneratedStructs(node)
+
+	fmt.Fprintln(out, `package `+node.Name.Name)
+	writeImports(out)
+	generateCode(out, genFuncs, genStructs)
+}
