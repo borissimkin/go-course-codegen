@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -20,20 +21,171 @@ type serveHTTPTempl struct {
 	GeneratedFuncs   []GeneratedFunc
 }
 
+type checkMethodTempl struct {
+	HttpMethod string
+}
+
+type responseTempl struct {
+	FuncName string
+}
+
+type baseValidationTempl struct {
+	FieldName string
+	VarName   string
+}
+
+type validationDefaultStringTempl struct {
+	baseValidationTempl
+	DefaultValue string
+}
+
+type validationDefaultIntTempl struct {
+	baseValidationTempl
+	DefaultValue int
+}
+
+type validationRequiredTempl struct {
+	baseValidationTempl
+	EmptyValue string
+}
+
+type validationEnumTempl struct {
+	baseValidationTempl
+	Enum []string
+}
+
+type validationMinMaxTempl struct {
+	baseValidationTempl
+	WithLen bool
+	Value   int
+	IsMin   bool
+}
+
+type validationCastToIntTempl struct {
+	baseValidationTempl
+}
+
 var (
 	serveHTTPTemplate = template.Must(template.New("serveHTTPTempl").Parse(`
 	// {{.ReceiverTypeName}}
-	func (h *{{.ReceiverTypeName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-			{{range $val := .GeneratedFuncs}}
-			case "{{$val.Url}}":
-				h.handler{{$val.FuncName}}(w, r)
-			{{end}}
-			default:
-				w.WriteHeader(http.StatusNotFound)
-		}
+func (h *{{.ReceiverTypeName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+		{{range $val := .GeneratedFuncs}}
+		case "{{$val.Url}}":
+			h.handler{{$val.FuncName}}(w, r)
+		{{end}}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+`))
+
+	checkMethodTemplate = template.Must(template.New("checkMethodTempl").Parse(`
+	// check http method
+	method := "{{.HttpMethod}}"
+	if r.Method != method {
+		w.WriteHeader(http.StatusNotAcceptable)
+		w.Write(getErrorResponse("bad method"))
+		return
+	}
+	`))
+
+	checkAuthTemplate = template.Must(template.New("checkAuthTempl").Parse(`
+	// check auth
+	token := r.Header.Get("X-Auth")
+	if !checkToken(token) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write(getErrorResponse("unathorized"))
+		return
+	}
+	`))
+
+	validationCastToIntTemplate = template.Must(template.New("validationCastToIntTempl").Parse(`
+	// cast to int
+	{{.VarName}}, err := strconv.Atoi({{.FieldName}})
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(getErrorResponse("{{.FieldName}} must be int"))
+	}
+	`))
+
+	validationDefaultStringTemplate = template.Must(template.New("validationDefaultStringTempl").Parse(`
+	// default
+	if {{.VarName}} == "" {
+		{{.VarName}} = "{{.DefaultValue}}"
+	}
+	`))
+
+	validationDefaultIntTemplate = template.Must(template.New("validationDefaultIntTempl").Parse(`
+	// default
+	if {{.VarName}} == 0 {
+		{{.VarName}} = {{.DefaultValue}}
+	}
+	`))
+
+	validationMinMaxTemplate = template.Must(template.New("validationMinMaxTempl").Parse(`
+	// {{if $.IsMin}}min{{else}}max{{end}}
+	if {{ if $.WithLen }}len({{.VarName}}){{ else }}{{.VarName}}{{ end }} {{ if $.IsMin }}< {{ else }}> {{ end }}{{$.Value}} {
+    	w.WriteHeader(http.StatusBadRequest)
+    	w.Write(getErrorResponse("{{.FieldName}}{{if $.WithLen}} len{{end}} must be {{if $.IsMin}}>= {{else}}<= {{end}}{{$.Value}}"))
+    	return
+	}
+	`))
+
+	validationRequiredTemplate = template.Must(template.New("validationRequiredTempl").Parse(`
+	// required
+	if {{.VarName}} == {{.EmptyValue}} {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(getErrorResponse("{{.FieldName}} must me not empty"))
+		return
+	}
+	`))
+
+	// todo: не робит цикл
+	validationEnumTemplate = template.Must(template.New("validationEnumTempl").Parse(`
+	// enum
+	if !(
+    	{{- range $i, $v := .Enum -}}
+        	{{- if gt $i 0}} || {{end -}}
+        	{{$.VarName}} == "{{$v}}"
+    	{{- end -}}
+	) {
+    	w.WriteHeader(http.StatusBadRequest)
+    	w.Write(getErrorResponse("{{.FieldName}} must be one of [
+        	{{- range $i, $v := .Enum -}}
+            	{{- if gt $i 0}}, {{end -}}
+            	{{$v}}
+        	{{- end -}}
+    	]"))
+    	return
+	}
+	`))
+
+	responseTemplate = template.Must(template.New("responseTempl").Parse(`
+	ctx := context.Background()
+
+	result := response{}
+
+	resp, err := h.{{.FuncName}}(ctx, params)
+	if err != nil {
+		apiError := err.(ApiError)
+
+		w.WriteHeader(apiError.HTTPStatus)
+		result.Error = apiError.Error()
+
+		data, _ := json.Marshal(result)
+		w.Write(data)
+		return
 	}
 
+	data, _ := json.Marshal(resp)
+	result.Response = data
+
+	data, _ = json.Marshal(result)
+	
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 	`))
 )
 
@@ -90,7 +242,6 @@ type GeneratedParamsField struct {
 	Max          ValidatorValue[int]
 }
 
-// todo: мапа?
 type GeneratedStruct struct {
 	Name       string
 	Attributes []GeneratedParamsField
@@ -112,27 +263,29 @@ func getGeneratedParamsField(tagValue string) GeneratedParamsField {
 	values := strings.Split(tagValue, ",")
 
 	for _, v := range values {
-		if v == validatorRequired {
+		field := strings.Split(v, "=")[0]
+
+		if field == validatorRequired {
 			params.Required = NewValidatorValue(true)
 		}
 
-		if v == validatorParamName {
+		if field == validatorParamName {
 			val := getValidatorValue(v)
 			params.ParamName = NewValidatorValue(val)
 		}
 
-		if v == validatorEnum {
+		if field == validatorEnum {
 			val := getValidatorValue(v)
 			values := getValidatorEnumValue(val)
 			params.Enum = NewValidatorValue(values)
 		}
 
-		if v == validatorDefault {
+		if field == validatorDefault {
 			val := getValidatorValue(v)
 			params.DefaultValue = NewValidatorValue(val)
 		}
 
-		if v == validatorMin {
+		if field == validatorMin {
 			val := getValidatorValue(v)
 
 			min, err := strconv.Atoi(val)
@@ -142,7 +295,7 @@ func getGeneratedParamsField(tagValue string) GeneratedParamsField {
 			params.Min = NewValidatorValue(min)
 		}
 
-		if v == validatorMax {
+		if field == validatorMax {
 			val := getValidatorValue(v)
 
 			max, err := strconv.Atoi(val)
@@ -301,7 +454,104 @@ func writeImports(out io.Writer) {
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 )`)
+}
+
+func writeUtils(out io.Writer) {
+	fmt.Fprintln(out, "type response struct {\n\tResponse json.RawMessage `json:\"response\"`\n\tError    string          `json:\"error\"`\n}\n\nfunc checkToken(token string) bool {\n\treturn token == \"100500\"\n}\n\nfunc getErrorResponse(err string) []byte {\n\tdata, _ := json.Marshal(response{\n\t\tError: err,\n\t})\n\n\treturn data\n}")
+}
+
+func generateValidationCode(out io.Writer, genStruct *GeneratedStruct) {
+	for _, attr := range genStruct.Attributes {
+
+		fieldName := strings.ToLower(attr.FieldName)
+		paramName := fieldName
+		fieldNameInt := fieldName + "Int"
+
+		baseValidation := baseValidationTempl{
+			FieldName: fieldName,
+			VarName:   fieldName,
+		}
+
+		if attr.FieldType == "int" {
+			baseValidation.VarName = fieldNameInt
+		}
+
+		if attr.ParamName.Exist {
+			paramName = attr.ParamName.Value
+		}
+
+		fmt.Fprintf(out, "\n	%v := r.FormValue(\"%v\")\n", fieldName, paramName)
+
+		if attr.FieldType == "int" {
+			validationCastToIntTemplate.Execute(out, validationCastToIntTempl{
+				baseValidationTempl: baseValidation,
+			})
+		}
+
+		if attr.DefaultValue.Exist {
+			switch attr.FieldType {
+			case "string":
+				validationDefaultStringTemplate.Execute(out, validationDefaultStringTempl{
+					baseValidationTempl: baseValidation,
+					DefaultValue:        attr.DefaultValue.Value,
+				})
+			case "int":
+				defaultValue, _ := strconv.Atoi(attr.DefaultValue.Value)
+
+				validationDefaultIntTemplate.Execute(out, validationDefaultIntTempl{
+					baseValidationTempl: baseValidation,
+					DefaultValue:        defaultValue,
+				})
+			}
+		}
+
+		if attr.Required.Exist {
+			emptyValue := ``
+			switch attr.FieldType {
+			case "string":
+				emptyValue = `""`
+				validationRequiredTemplate.Execute(out, validationRequiredTempl{
+					baseValidationTempl: baseValidation,
+					EmptyValue:          emptyValue,
+				})
+			case "int":
+				emptyValue = `0`
+				validationRequiredTemplate.Execute(out, validationRequiredTempl{
+					baseValidationTempl: baseValidation,
+					EmptyValue:          emptyValue,
+				})
+			}
+		}
+
+		if attr.Min.Exist {
+			validationMinMaxTemplate.Execute(out, validationMinMaxTempl{
+				baseValidationTempl: baseValidation,
+				WithLen:             attr.FieldType == "string",
+				Value:               attr.Max.Value,
+				IsMin:               true,
+			})
+		}
+
+		if attr.Max.Exist {
+			validationMinMaxTemplate.Execute(out, validationMinMaxTempl{
+				baseValidationTempl: baseValidation,
+				WithLen:             attr.FieldType == "string",
+				Value:               attr.Max.Value,
+				IsMin:               false,
+			})
+		}
+
+		if attr.Enum.Exist {
+			validationEnumTemplate.Execute(out, validationEnumTempl{
+				baseValidationTempl: baseValidation,
+				Enum:                attr.Enum.Value,
+			})
+		}
+
+		fmt.Fprintf(out, "\n	params.%v = %v\n", attr.FieldName, fieldName)
+	}
 }
 
 func generateCode(out io.Writer, funcs []GeneratedFunc, structs []GeneratedStruct) error {
@@ -316,6 +566,50 @@ func generateCode(out io.Writer, funcs []GeneratedFunc, structs []GeneratedStruc
 			ReceiverTypeName: k,
 			GeneratedFuncs:   v,
 		})
+
+		for _, f := range v {
+			fmt.Fprintf(out, "func (h *%s) handler%s(w http.ResponseWriter, r *http.Request) {\n", k, f.FuncName)
+
+			if f.Method != "" {
+				method := http.MethodPost
+				if f.Method == http.MethodGet {
+					method = http.MethodGet
+				}
+
+				checkMethodTemplate.Execute(out, checkMethodTempl{
+					HttpMethod: method,
+				})
+			}
+
+			if f.Auth {
+				checkAuthTemplate.Execute(out, nil)
+			}
+
+			fmt.Fprintln(out)
+			fmt.Fprintf(out, "	params := %v{}\n", f.InTypeName)
+
+			// валидация
+			var genStruct *GeneratedStruct
+			for _, s := range structs {
+				if s.Name == f.InTypeName {
+					genStruct = &s
+					break
+				}
+			}
+
+			if genStruct != nil {
+				generateValidationCode(out, genStruct)
+			}
+
+			// ---
+
+			responseTemplate.Execute(out, responseTempl{
+				FuncName: f.FuncName,
+			})
+
+			fmt.Fprint(out, "\n}\n\n")
+		}
+
 	}
 
 	return nil
@@ -340,5 +634,6 @@ func main() {
 
 	fmt.Fprintln(out, `package `+node.Name.Name)
 	writeImports(out)
+	writeUtils(out)
 	generateCode(out, genFuncs, genStructs)
 }

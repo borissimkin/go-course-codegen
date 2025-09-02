@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 )
 
 // SomeStructName (структура на которой нашли apigen)
@@ -78,13 +79,47 @@ func (h *MyApi) handlerProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	} // и тд
 
+	// new enum
+	// loginEnums := []string{"test1", "test2"}
+	// loginEnumOk := slices.Contains(loginEnums, login)
+	// if !loginEnumOk {
+	// 	w.WriteHeader(http.StatusBadRequest)
+	// 	w.Write(getErrorResponse("login must be one of [test1, test2]"))
+	// 	return
+	// }
+
 	// min
-	if len(login) <= 10 {
+	if len(login) < 10 {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write(getErrorResponse("login must be one of [test1, test2]"))
+		w.Write(getErrorResponse("login len must be >= 10"))
+		return
 	}
 
+	// max
+	if len(login) > 10 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(getErrorResponse("login len must be <= 10"))
+		return
+	}
 	params.Login = login
+
+	// для инта что у нас может быть
+	fieldName := r.FormValue("fieldName")
+
+	fieldNameValue, err := strconv.Atoi(fieldName)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(getErrorResponse("fieldName must be int"))
+	}
+	// default
+	if fieldNameValue == 0 {
+		fieldNameValue = 123
+	}
+
+	// required
+	if fieldNameValue == 0 {
+
+	}
 
 	// завершение валидации
 	ctx := context.Background()
